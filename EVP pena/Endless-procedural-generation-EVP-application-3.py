@@ -8,13 +8,15 @@ import time
 import numpy as np
 import sounddevice as sd
 from pydub import AudioSegment
+from PIL import Image, ImageTk
+import queue
 
 # Параметры по умолчанию
 DEFAULT_SAMPLE_RATE = 44100  # Гц
 DEFAULT_CHANNELS = 2
 DEFAULT_SAMPLE_WIDTH = 2  # bytes (16-bit)
 
-# Глобальные переменные для управления циклах
+# Глобальные переменные для управления циклами
 random_loop_thread = None
 random_loop_stop_event = None
 
@@ -49,6 +51,34 @@ def parse_number_array(text):
     return ints, meta
 
 
+def _apply_evp_limit(raw_bytes, evp_enabled, evp_min, evp_max):
+    """
+    Если evp_enabled, линейно масштабируем значения 0..255 в диапазон [evp_min..evp_max].
+    Используем таблицу трансляции для эффективности.
+    """
+    if not evp_enabled:
+        return raw_bytes
+    try:
+        lo = int(max(0, min(255, evp_min)))
+        hi = int(max(0, min(255, evp_max)))
+    except Exception:
+        lo, hi = 0, 255
+    if lo >= hi:
+        # если границы некорректны — вернуть оригинал
+        return raw_bytes
+    span = hi - lo
+    table = bytes([int(lo + round((i / 255.0) * span)) for i in range(256)])
+    try:
+        return raw_bytes.translate(table)
+    except Exception:
+        # fallback на простую петлю
+        ba = bytearray(raw_bytes)
+        for i in range(len(ba)):
+            b = ba[i]
+            ba[i] = table[b]
+        return bytes(ba)
+
+
 def _bytes_to_float32(raw_bytes, sample_width, channels):
     if len(raw_bytes) == 0:
         return np.zeros((0,), dtype=np.float32)
@@ -63,7 +93,6 @@ def _bytes_to_float32(raw_bytes, sample_width, channels):
         arr = np.frombuffer(raw_bytes, dtype=np.uint8).astype(np.float32)
         arr = (arr - 128.0) / 128.0
     elif sample_width == 2:
-        # интерпретируем байты как signed 16-bit little-endian
         arr = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
         arr = arr / 32768.0
     else:
@@ -79,8 +108,8 @@ def _bytes_to_float32(raw_bytes, sample_width, channels):
     return arr.astype(np.float32)
 
 
-def _loop_play_random_from_file(numbers, meta, stop_event):
-    # Воспроизведение из файла: выбираются случайные ФРЕЙМЫ (по frame_size байт)
+def _loop_play_random_from_file(numbers, meta, stop_event, evp_enabled=False, evp_min=0, evp_max=255):
+    # Воспроизведение из файла (байтовые фрагменты)
     if not numbers:
         return
 
@@ -114,22 +143,18 @@ def _loop_play_random_from_file(numbers, meta, stop_event):
                 while buffer_ms_acc < play_buffer_ms and not stop_event.is_set():
                     chunk_ms = random.randint(min_chunk_ms, max_chunk_ms)
                     needed_bytes = max(1, int(bytes_per_sec * (chunk_ms / 1000.0)))
-                    # выравниваем по frame_size
                     if needed_bytes % frame_size != 0:
                         needed_bytes += (frame_size - (needed_bytes % frame_size))
 
-                    # Вместо CONTIGUOUS selection — формируем выборку из случайных фреймов
-                    needed_frames = max(1, needed_bytes // frame_size)
-                    sel = bytearray()
-                    total_frames = nbytes // frame_size
-                    if total_frames >= 1:
-                        # выбираем нужное количество фреймов случайно (с повторениями)
-                        for _ in range(needed_frames):
-                            fi = random.randint(0, total_frames - 1)
-                            start = fi * frame_size
-                            sel.extend(byte_array[start:start + frame_size])
+                    if needed_bytes <= nbytes:
+                        max_start = nbytes - needed_bytes
+                        if max_start <= 0:
+                            start = 0
+                        else:
+                            steps = max_start // frame_size
+                            start = random.randint(0, steps) * frame_size
+                        sel = byte_array[start:start + needed_bytes]
                     else:
-                        # fallback: просто растянем весь массив
                         reps = (needed_bytes + nbytes - 1) // nbytes
                         sel = (byte_array * reps)[:needed_bytes]
 
@@ -139,7 +164,9 @@ def _loop_play_random_from_file(numbers, meta, stop_event):
                 if len(buffer_bytes) == 0:
                     continue
 
-                audio_np = _bytes_to_float32(buffer_bytes, sample_width, channels)
+                # применим EVP-лимитирование, если включено
+                modified = _apply_evp_limit(bytes(buffer_bytes), evp_enabled, evp_min, evp_max)
+                audio_np = _bytes_to_float32(modified, sample_width, channels)
                 try:
                     stream.write(audio_np)
                 except Exception:
@@ -154,14 +181,13 @@ def _loop_play_random_from_file(numbers, meta, stop_event):
         return
 
 
-def _start_white_noise_stream(meta, stop_event, highlight_callback=None, volume=0.3, highlight_interval=0.08, allowed_numbers=None):
+def _start_white_noise_stream(meta, stop_event, highlight_callback=None, volume=0.3, highlight_interval=0.08):
     """
-    Генерирует белый шум. Если allowed_numbers передан (список 0..255), то вместо uniform генерируем байты
-    из этого набора и конвертируем их в float через _bytes_to_float32 (с учётом sample_width).
+    Генерирует равномерный белый шум в -1..1 (float) и проигрывает его.
+    Оставлен как fallback, если у нас нет содержимого поля в режиме bytes.
     """
     sample_rate = int(meta.get('sample_rate', DEFAULT_SAMPLE_RATE)) if meta else DEFAULT_SAMPLE_RATE
     channels = int(meta.get('channels', DEFAULT_CHANNELS)) if meta else DEFAULT_CHANNELS
-    sample_width = int(meta.get('sample_width', DEFAULT_SAMPLE_WIDTH)) if meta else DEFAULT_SAMPLE_WIDTH
 
     sample_rate = max(8000, sample_rate)
     blocksize = 1024
@@ -171,38 +197,18 @@ def _start_white_noise_stream(meta, stop_event, highlight_callback=None, volume=
             pass
         if stop_event.is_set():
             raise sd.CallbackStop()
-
-        if allowed_numbers:
-            # генерируем байты из allowed_numbers
-            nbytes = frames * channels * sample_width
-            chosen = random.choices(allowed_numbers, k=nbytes)
-            raw = bytes(chosen)
-            audio_np = _bytes_to_float32(raw, sample_width, channels)
-            # умножаем на volume
-            try:
-                outdata[:] = (audio_np * volume)
-            except Exception:
-                # fallback на uniform
-                if channels == 1:
-                    noise = np.random.uniform(-1.0, 1.0, frames).astype(np.float32)
-                    out = (noise * volume).reshape(frames, 1)
-                else:
-                    noise = np.random.uniform(-1.0, 1.0, (frames, channels)).astype(np.float32)
-                    out = noise * volume
-                outdata[:] = out
+        if channels == 1:
+            noise = np.random.uniform(-1.0, 1.0, frames).astype(np.float32)
+            out = (noise * volume).reshape(frames, 1)
         else:
-            if channels == 1:
-                noise = np.random.uniform(-1.0, 1.0, frames).astype(np.float32)
-                out = (noise * volume).reshape(frames, 1)
-            else:
-                noise = np.random.uniform(-1.0, 1.0, (frames, channels)).astype(np.float32)
-                out = noise * volume
-            outdata[:] = out
+            noise = np.random.uniform(-1.0, 1.0, (frames, channels)).astype(np.float32)
+            out = noise * volume
+        outdata[:] = out
 
         callback._counter += frames
         if callback._counter >= sample_rate * highlight_interval:
             callback._counter = 0
-            num = random.randint(0, 255) if not allowed_numbers else random.choice(allowed_numbers)
+            num = random.randint(0, 255)
             if highlight_callback:
                 try:
                     highlight_callback(num)
@@ -232,13 +238,16 @@ def _start_white_noise_stream(meta, stop_event, highlight_callback=None, volume=
         return
 
 
-def _start_white_noise_from_bytes(numbers, meta, stop_event, highlight_callback=None, volume=0.35, highlight_interval=0.08, allowed_numbers=None):
+def _start_white_noise_from_bytes(numbers, meta, stop_event, highlight_callback=None, volume=0.35, highlight_interval=0.08, evp_enabled=False, evp_min=0, evp_max=255):
     """
-    Воспроизводит непрерывный поток. Если allowed_numbers указан — генерируем байты только из этого набора,
-    иначе используем random-фреймы из переданных numbers/byte_array.
+    Воспроизводит непрерывный поток, составленный из случайных фрагментов байтового источника (mode=bytes).
+    Станет полностью эквивалентен поведению кнопки "Случайный звук из файла":
+    - те же размеры чанков (min/max),
+    - та же стратегия сборки буфера (play_buffer_ms),
+    - проигрывание буфера через stream.write (gapless),
+    - периодическая подсветка через highlight_callback.
     """
-    # Если нет данных — ничего не делаем
-    if not numbers and not allowed_numbers:
+    if not numbers:
         return
     # Берём параметры из метаданных
     base_rate = int(meta.get('sample_rate', DEFAULT_SAMPLE_RATE)) if meta else DEFAULT_SAMPLE_RATE
@@ -248,18 +257,20 @@ def _start_white_noise_from_bytes(numbers, meta, stop_event, highlight_callback=
     frame_rate = max(8000, base_rate)
     frame_size = max(1, sample_width * channels)
 
-    byte_array = bytes(numbers) if numbers else b''
+    byte_array = bytes(numbers)
     nbytes = len(byte_array)
-
-    if nbytes > 0:
-        rem = nbytes % frame_size
-        if rem != 0:
-            need = frame_size - rem
-            byte_array = byte_array + (byte_array[:need] if len(byte_array) >= need else (byte_array * ((need // len(byte_array)) + 1))[:need])
-            nbytes = len(byte_array)
+    if nbytes == 0:
+        return
+    # выровняем длину
+    rem = nbytes % frame_size
+    if rem != 0:
+        need = frame_size - rem
+        byte_array = byte_array + (byte_array[:need] if len(byte_array) >= need else (byte_array * ((need // len(byte_array)) + 1))[:need])
+        nbytes = len(byte_array)
 
     bytes_per_sec = frame_rate * channels * sample_width
 
+    # Сделаем те же параметры, что и в _loop_play_random_from_file
     min_chunk_ms = 100
     max_chunk_ms = 2000
     play_buffer_ms = 5000
@@ -275,22 +286,17 @@ def _start_white_noise_from_bytes(numbers, meta, stop_event, highlight_callback=
                     if needed_bytes % frame_size != 0:
                         needed_bytes += (frame_size - (needed_bytes % frame_size))
 
-                    if allowed_numbers:
-                        # генерируем данные строго из allowed_numbers
-                        chosen = random.choices(allowed_numbers, k=needed_bytes)
-                        sel = bytes(chosen)
-                    else:
-                        if needed_bytes <= nbytes and nbytes > 0:
-                            max_start = nbytes - needed_bytes
-                            if max_start <= 0:
-                                start = 0
-                            else:
-                                steps = max_start // frame_size
-                                start = random.randint(0, steps) * frame_size
-                            sel = byte_array[start:start + needed_bytes]
+                    if needed_bytes <= nbytes:
+                        max_start = nbytes - needed_bytes
+                        if max_start <= 0:
+                            start = 0
                         else:
-                            reps = (needed_bytes + nbytes - 1) // nbytes if nbytes > 0 else 1
-                            sel = (byte_array * reps)[:needed_bytes]
+                            steps = max_start // frame_size
+                            start = random.randint(0, steps) * frame_size
+                        sel = byte_array[start:start + needed_bytes]
+                    else:
+                        reps = (needed_bytes + nbytes - 1) // nbytes
+                        sel = (byte_array * reps)[:needed_bytes]
 
                     buffer_bytes.extend(sel)
                     buffer_ms_acc = int((len(buffer_bytes) / bytes_per_sec) * 1000)
@@ -298,7 +304,9 @@ def _start_white_noise_from_bytes(numbers, meta, stop_event, highlight_callback=
                 if len(buffer_bytes) == 0:
                     continue
 
-                audio_np = _bytes_to_float32(buffer_bytes, sample_width, channels)
+                # применим EVP-ограничение к собранному буферу
+                modified = _apply_evp_limit(bytes(buffer_bytes), evp_enabled, evp_min, evp_max)
+                audio_np = _bytes_to_float32(modified, sample_width, channels)
                 try:
                     stream.write(audio_np)
                 except Exception:
@@ -306,14 +314,17 @@ def _start_white_noise_from_bytes(numbers, meta, stop_event, highlight_callback=
                         break
                     continue
 
+                # highlight — делаем примерно так же, как в callback'е white-noise
+                # Вызываем highlight случайным образом в пределах собранного буфера
                 if highlight_callback:
+                    # количество срабатываний подсветки в одном буфере зависит от длины буфера
                     try:
                         buffer_seconds = len(buffer_bytes) / bytes_per_sec
                         hits = max(1, int(buffer_seconds / highlight_interval))
                         for _ in range(hits):
                             if stop_event.is_set():
                                 break
-                            num = random.randint(0, 255) if not allowed_numbers else random.choice(allowed_numbers)
+                            num = random.randint(0, 255)
                             try:
                                 highlight_callback(num)
                             except Exception:
@@ -328,19 +339,102 @@ def _start_white_noise_from_bytes(numbers, meta, stop_event, highlight_callback=
         return
 
 
-# --- GUI: комбинированное приложение (звуки + табло чисел 0..255) ---
+# --- Video EGF helpers ---
+
+def _start_video_from_bytes(numbers, meta, stop_event, out_queue, fps=20, width=320, height=240, evp_enabled=False, evp_min=0, evp_max=255):
+    """
+    Производит бесконечную генерацию кадров из байтового источника в режиме mode=bytes.
+    Логика сборки буфера аналогична аудио: случайные чанки, сборка play_buffer, затем разбиение на кадры.
+    Кадры кладутся в очередь out_queue как raw bytes длины width*height*channels.
+    """
+    if not numbers:
+        return
+
+    channels = 3
+    frame_size = width * height * channels
+    byte_array = bytes(numbers)
+    nbytes = len(byte_array)
+    if nbytes == 0:
+        return
+
+    # выровняем длину относительно frame_size
+    rem = nbytes % frame_size
+    if rem != 0:
+        need = frame_size - rem
+        byte_array = byte_array + (byte_array[:need] if len(byte_array) >= need else (byte_array * ((need // len(byte_array)) + 1))[:need])
+        nbytes = len(byte_array)
+
+    bytes_per_frame = frame_size
+    bytes_per_sec = bytes_per_frame * fps
+
+    min_chunk_ms = 100
+    max_chunk_ms = 2000
+    play_buffer_ms = 3000
+
+    try:
+        while not stop_event.is_set():
+            buffer_bytes = bytearray()
+            buffer_ms_acc = 0
+            while buffer_ms_acc < play_buffer_ms and not stop_event.is_set():
+                chunk_ms = random.randint(min_chunk_ms, max_chunk_ms)
+                chunk_frames = max(1, int(fps * (chunk_ms / 1000.0)))
+                needed_bytes = chunk_frames * bytes_per_frame
+
+                if needed_bytes <= nbytes:
+                    max_start = nbytes - needed_bytes
+                    if max_start <= 0:
+                        start = 0
+                    else:
+                        steps = max_start // frame_size
+                        start = random.randint(0, steps) * frame_size
+                    sel = byte_array[start:start + needed_bytes]
+                else:
+                    reps = (needed_bytes + nbytes - 1) // nbytes
+                    sel = (byte_array * reps)[:needed_bytes]
+
+                buffer_bytes.extend(sel)
+                buffer_ms_acc = int((len(buffer_bytes) / bytes_per_sec) * 1000) if bytes_per_sec > 0 else 0
+
+            if len(buffer_bytes) == 0:
+                continue
+
+            # Разбиваем buffer_bytes на кадры и кладём их в очередь
+            try:
+                total_frames = len(buffer_bytes) // frame_size
+                for i in range(total_frames):
+                    if stop_event.is_set():
+                        break
+                    start = i * frame_size
+                    frm = bytes(buffer_bytes[start:start + frame_size])
+                    # применим EVP-фильтр, если включён
+                    frm = _apply_evp_limit(frm, evp_enabled, evp_min, evp_max)
+                    # Блокируем очередь, если полна — ждём
+                    try:
+                        out_queue.put(frm, timeout=0.5)
+                    except Exception:
+                        if stop_event.is_set():
+                            break
+                        continue
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def generate_random_frame(width, height):
+    return np.random.randint(0, 256, (height, width, 3), dtype=np.uint8).tobytes()
+
+
+# --- GUI: комбинированное приложение (звуки + табло чисел 0..255 + video EGF) ---
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Конвертер чисел <-> MP3 + Табло 0..255 + EGF (white-noise)")
-        self.geometry("1280x760")
+        self.title("Конвертер чисел <-> MP3 + Табло 0..255 + EGF (audio+video)")
+        self.geometry("1280x800")
 
-        info = ("В этом окне можно: загрузить файл с числами (0..255) и запустить бесконечный\n"
-                "циклический поток случайных фрагментов из файла (gapless через sounddevice),\n"
-                "запустить EGF трансляцию — теперь это может быть непрерывный поток из фрагментов файла\n"
-                "(если в поле указаны байты и #META mode=bytes),\n"
-                "и подсветка на табло будет показывать случайные числа 0..255 с небольшой частотой.\n"
-                "Дополнительно: можно задать Ограниченный EVP диапазон — тогда EGF будет генерировать аудио только из выбранных байтов.)")
+        info = ("Здесь можно: загрузить файл с байтами (0..255), запустить бесконечный поток случайных фрагментов из файла (audio),\n"
+                "запустить EGF трансляцию аудио и/или видео — теперь видео также может брать байты из поля (mode=bytes)\n"
+                "и будет генерироваться непрерывный поток кадров по той же логике сборки буфера, что и аудио.")
 
         tk.Label(self, text=info, justify=tk.LEFT).pack(pady=8)
 
@@ -349,7 +443,7 @@ class App(tk.Tk):
 
         self.text_input = tk.Text(top_frame, height=6, width=120)
         self.text_input.pack(side=tk.LEFT, padx=(0,8), pady=6)
-        self.text_input.insert("1.0", "Пример содержимого файла:\n#META mode=bytes sample_rate=44100 channels=2 sample_width=2\n0 127 255 34 200 ...")
+        self.text_input.insert("1.0", "Пример содержимого файла:\n#META mode=bytes sample_rate=44100 channels=2 sample_width=2 video_width=320 video_height=240 video_fps=20\n0 127 255 34 200 ...")
 
         btns_frame = tk.Frame(top_frame)
         btns_frame.pack(side=tk.LEFT, fill=tk.Y)
@@ -366,15 +460,11 @@ class App(tk.Tk):
                                         command=self.on_create_from_text, width=30)
         self.create_mp3_btn.pack(pady=4)
 
-        self.egf_btn = tk.Button(btns_frame, text="EGF трансляция (Старт)", command=self.on_egf_toggle, width=30)
-        self.egf_btn.pack(pady=8)
+        self.egf_audio_btn = tk.Button(btns_frame, text="EGF аудио (Старт)", command=self.on_egf_audio_toggle, width=30)
+        self.egf_audio_btn.pack(pady=4)
 
-        # Новая кнопка: Ограниченный EVP диапазон
-        self.evp_allowed = None  # список разрешённых байтов (или None)
-        self.evp_btn = tk.Button(btns_frame, text="Ограниченный EVP диапазон", command=self.on_evp_range_toggle, width=30)
-        self.evp_btn.pack(pady=4)
-        self.evp_label = tk.Label(btns_frame, text="EVP: нет ограничений", wraplength=220, justify=tk.LEFT)
-        self.evp_label.pack(pady=(0,6))
+        self.egf_video_btn = tk.Button(btns_frame, text="EGF видео (Старт)", command=self.on_egf_video_toggle, width=30)
+        self.egf_video_btn.pack(pady=4)
 
         sep = tk.Frame(self, height=2, bd=1, relief=tk.SUNKEN)
         sep.pack(fill=tk.X, padx=5, pady=8)
@@ -411,16 +501,31 @@ class App(tk.Tk):
         tk.Radiobutton(controls_frame, text='Последовательный 0..255', variable=self.order_var, value='sequential').grid(row=1, column=0, columnspan=3, sticky='w', pady=(6,0))
         tk.Radiobutton(controls_frame, text='Перемешанный (shuffle)', variable=self.order_var, value='shuffle').grid(row=1, column=3, columnspan=3, sticky='w', pady=(6,0))
 
+        # --- Новый контрол: Ограниченный EVP диапазон ---
+        self.evp_var = tk.IntVar(value=0)
+        self.evp_check = tk.Checkbutton(controls_frame, text='Ограниченный EVP диапазон', variable=self.evp_var)
+        self.evp_check.grid(row=2, column=4, columnspan=2, sticky='w', padx=(12,0))
+
+        tk.Label(controls_frame, text='EVP min:').grid(row=2, column=6, sticky='e')
+        self.evp_min_var = tk.IntVar(value=0)
+        self.evp_min_spin = tk.Spinbox(controls_frame, from_=0, to=255, width=5, textvariable=self.evp_min_var)
+        self.evp_min_spin.grid(row=2, column=7, padx=2)
+
+        tk.Label(controls_frame, text='EVP max:').grid(row=2, column=8, sticky='e')
+        self.evp_max_var = tk.IntVar(value=255)
+        self.evp_max_spin = tk.Spinbox(controls_frame, from_=0, to=255, width=5, textvariable=self.evp_max_var)
+        self.evp_max_spin.grid(row=2, column=9, padx=2)
+
         self.start_btn = tk.Button(controls_frame, text="Старт табло", command=self.start_board)
-        self.start_btn.grid(row=2, column=0, padx=6, pady=8)
+        self.start_btn.grid(row=3, column=0, padx=6, pady=8)
         self.stop_btn = tk.Button(controls_frame, text="Стоп табло", command=self.stop_board, state=tk.DISABLED)
-        self.stop_btn.grid(row=2, column=1, padx=6, pady=8)
+        self.stop_btn.grid(row=3, column=1, padx=6, pady=8)
 
         self.randomize_btn = tk.Button(controls_frame, text="Обновить сейчас", command=self.generate_board_once)
-        self.randomize_btn.grid(row=2, column=2, padx=6, pady=8)
+        self.randomize_btn.grid(row=3, column=2, padx=6, pady=8)
 
         self.save_board_btn = tk.Button(controls_frame, text="Сохранить табло на рабочий стол", command=self.save_board)
-        self.save_board_btn.grid(row=2, column=3, padx=6, pady=8)
+        self.save_board_btn.grid(row=3, column=3, padx=6, pady=8)
 
         self.board_text = tk.Text(board_frame, wrap=tk.NONE, font=("Consolas", 12))
         self.board_text.pack(fill=tk.BOTH, expand=True)
@@ -433,6 +538,13 @@ class App(tk.Tk):
         self._egf_thread = None
         self._egf_stop_event = None
         self._egf_running = False
+
+        # video egf state
+        self._egf_video_thread = None
+        self._egf_video_stop_event = None
+        self._egf_video_queue = None
+        self._egf_video_window = None
+        self._egf_video_running = False
 
         self._init_board()
         self._render_board()
@@ -503,16 +615,24 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка парсинга", str(e))
             return
 
+        # возьмём параметры EVP из UI
+        evp_enabled = bool(self.evp_var.get())
+        try:
+            evp_min = int(self.evp_min_var.get())
+            evp_max = int(self.evp_max_var.get())
+        except Exception:
+            evp_min, evp_max = 0, 255
+
         stop_event = threading.Event()
         random_loop_stop_event = stop_event
-        thread = threading.Thread(target=_loop_play_random_from_file, args=(numbers, meta, stop_event), daemon=True)
+        thread = threading.Thread(target=_loop_play_random_from_file, args=(numbers, meta, stop_event, evp_enabled, evp_min, evp_max), daemon=True)
         random_loop_thread = thread
         thread.start()
         messagebox.showinfo("Старт", "Запущен бесконечный цикл случайных звуков из выбранного файла (нажатие кнопки остановит).")
         self.random_file_btn.config(text="Случайный звук из файла (Стоп)")
 
-    # --- EGF: white-noise / from bytes ---
-    def on_egf_toggle(self):
+    # --- EGF: audio (white-noise / from bytes) ---
+    def on_egf_audio_toggle(self):
         if self._egf_running:
             # остановка
             self._egf_stop_event.set()
@@ -521,7 +641,7 @@ class App(tk.Tk):
             self._egf_thread = None
             self._egf_stop_event = None
             self._egf_running = False
-            self.egf_btn.config(text="EGF трансляция (Старт)")
+            self.egf_audio_btn.config(text="EGF аудио (Старт)")
             return
 
         # старт: определяем коэффициент скорости
@@ -546,6 +666,14 @@ class App(tk.Tk):
             # не фатально — будем использовать белый шум
             use_bytes_source = False
 
+        # EVP параметры
+        evp_enabled = bool(self.evp_var.get())
+        try:
+            evp_min = int(self.evp_min_var.get())
+            evp_max = int(self.evp_max_var.get())
+        except Exception:
+            evp_min, evp_max = 0, 255
+
         stop_event = threading.Event()
         self._egf_stop_event = stop_event
 
@@ -555,59 +683,137 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        # передадим выбранные пользователем allowed numbers
-        allowed = self.evp_allowed if hasattr(self, 'evp_allowed') else None
-
         if use_bytes_source and numbers:
             # используем метаданные, но применяем коэффициент скорости к sample_rate
             meta_play = dict(meta) if meta else {}
             base_sr = int(meta_play.get('sample_rate', DEFAULT_SAMPLE_RATE))
             meta_play['sample_rate'] = max(8000, int(base_sr * coeff))
-            thread = threading.Thread(target=_start_white_noise_from_bytes, args=(numbers, meta_play, stop_event, highlight_cb, 0.35, 0.08, allowed), daemon=True)
+            thread = threading.Thread(target=_start_white_noise_from_bytes, args=(numbers, meta_play, stop_event, highlight_cb, 0.35, 0.08, evp_enabled, evp_min, evp_max), daemon=True)
         else:
             # fallback: обычный white-noise, скорость регулируем через изменение sample_rate
-            meta_play = {'sample_rate': max(8000, int(DEFAULT_SAMPLE_RATE * coeff)), 'channels': DEFAULT_CHANNELS, 'sample_width': DEFAULT_SAMPLE_WIDTH}
-            thread = threading.Thread(target=_start_white_noise_stream, args=(meta_play, stop_event, highlight_cb, 0.35, 0.08, allowed), daemon=True)
+            meta_play = {'sample_rate': max(8000, int(DEFAULT_SAMPLE_RATE * coeff)), 'channels': DEFAULT_CHANNELS}
+            thread = threading.Thread(target=_start_white_noise_stream, args=(meta_play, stop_event, highlight_cb, 0.35, 0.08), daemon=True)
 
         self._egf_thread = thread
         self._egf_running = True
         thread.start()
-        self.egf_btn.config(text="EGF трансляция (Стоп)")
+        self.egf_audio_btn.config(text="EGF аудио (Стоп)")
 
-    def on_evp_range_toggle(self):
-        # Если уже установлено — очистим
-        if self.evp_allowed:
-            self.evp_allowed = None
-            self.evp_label.config(text="EVP: нет ограничений")
-            messagebox.showinfo("EVP", "Ограничение EVP удалено.")
+    # --- EGF: video (white-noise / from bytes) ---
+    def on_egf_video_toggle(self):
+        if self._egf_video_running:
+            # остановка
+            if self._egf_video_stop_event:
+                self._egf_video_stop_event.set()
+            if self._egf_video_thread:
+                self._egf_video_thread.join(timeout=1.0)
+            self._egf_video_thread = None
+            self._egf_video_stop_event = None
+            self._egf_video_running = False
+            # закроем окно видео
+            try:
+                if self._egf_video_window:
+                    self._egf_video_window.destroy()
+                    self._egf_video_window = None
+            except Exception:
+                pass
+            self.egf_video_btn.config(text="EGF видео (Старт)")
             return
 
-        file_path = filedialog.askopenfilename(title="Выберите текстовый файл с числами EVP",
-                                               filetypes=[("Text files", ".txt .csv .log .dat"), ("All files", "*")])
-        if not file_path:
-            return
+        # старт
+        raw_text = self.text_input.get("1.0", tk.END).strip()
+        use_bytes_source = False
+        numbers = None
+        meta = None
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = f.read()
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
-            return
+            numbers, meta = parse_number_array(raw_text)
+            if meta and str(meta.get('mode', '')).lower() == 'bytes':
+                use_bytes_source = True
+        except Exception:
+            use_bytes_source = False
 
-        nums = re.findall(r"\d+", data)
-        if not nums:
-            messagebox.showerror("Ошибка", "В файле не найдено чисел 0..255.")
-            return
-        ints = [int(s) for s in nums]
-        cleaned = [n for n in ints if 0 <= n <= 255]
-        if not cleaned:
-            messagebox.showerror("Ошибка", "В файле не найдено допустимых чисел 0..255.")
-            return
-        # уникализируем и сохраним
-        allowed = sorted(set(cleaned))
-        self.evp_allowed = allowed
-        preview = ','.join(str(x) for x in allowed[:20]) + (',...' if len(allowed) > 20 else '')
-        self.evp_label.config(text=f"EVP: {len(allowed)} значений\n{preview}")
-        messagebox.showinfo("EVP установлен", f"Разрешённые байты загружены: {len(allowed)} значений.")
+        # параметры видео
+        try:
+            fps = int(meta.get('video_fps', 20)) if meta else 20
+            width = int(meta.get('video_width', 520)) if meta else 520
+            height = int(meta.get('video_height', 440)) if meta else 440
+        except Exception:
+            fps, width, height = 20, 320, 240
+
+        # EVP параметры
+        evp_enabled = bool(self.evp_var.get())
+        try:
+            evp_min = int(self.evp_min_var.get())
+            evp_max = int(self.evp_max_var.get())
+        except Exception:
+            evp_min, evp_max = 0, 255
+
+        stop_event = threading.Event()
+        self._egf_video_stop_event = stop_event
+        q = queue.Queue(maxsize=256)
+        self._egf_video_queue = q
+
+        # создаём окно видео в main thread
+        win = tk.Toplevel(self)
+        win.title("EGF Video")
+        canvas = tk.Canvas(win, width=width, height=height)
+        canvas.pack()
+        self._egf_video_window = win
+
+        # consumer (main thread) — отрисовка кадров из очереди
+        def consumer_loop():
+            if stop_event.is_set():
+                return
+            try:
+                frm_bytes = None
+                try:
+                    frm_bytes = q.get_nowait()
+                except Exception:
+                    frm_bytes = None
+                if frm_bytes is not None:
+                    # конвертируем в изображение
+                    arr = np.frombuffer(frm_bytes, dtype=np.uint8)
+                    try:
+                        arr = arr.reshape((height, width, 3))
+                        img = Image.fromarray(arr, 'RGB')
+                        photo = ImageTk.PhotoImage(img)
+                        canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+                        # сохранить ссылку, чтобы изображение не удалялось
+                        canvas.image = photo
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # запланировать следующий тик
+            win.after(int(1000 / max(1, fps)), consumer_loop)
+
+        consumer_loop()
+
+        if use_bytes_source and numbers:
+            th = threading.Thread(target=_start_video_from_bytes, args=(numbers, meta or {}, stop_event, q, fps, width, height, evp_enabled, evp_min, evp_max), daemon=True)
+            self._egf_video_thread = th
+            th.start()
+        else:
+            # fallback: генерация случайных кадров прямо в consumer через очередь
+            def gen_thread():
+                try:
+                    while not stop_event.is_set():
+                        frm = generate_random_frame(width, height)
+                        try:
+                            q.put(frm, timeout=0.5)
+                        except Exception:
+                            if stop_event.is_set():
+                                break
+                            continue
+                        time.sleep(1.0 / max(1, fps))
+                except Exception:
+                    pass
+            th = threading.Thread(target=gen_thread, daemon=True)
+            self._egf_video_thread = th
+            th.start()
+
+        self._egf_video_running = True
+        self.egf_video_btn.config(text="EGF видео (Стоп)")
 
     def _highlight_number(self, n):
         try:
@@ -770,6 +976,18 @@ class App(tk.Tk):
                 self._egf_thread.join(timeout=1.0)
             except Exception:
                 pass
+        if self._egf_video_thread and self._egf_video_thread.is_alive():
+            if self._egf_video_stop_event:
+                self._egf_video_stop_event.set()
+            try:
+                self._egf_video_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        try:
+            if self._egf_video_window:
+                self._egf_video_window.destroy()
+        except Exception:
+            pass
         self.destroy()
 
 
