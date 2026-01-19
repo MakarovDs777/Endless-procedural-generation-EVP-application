@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import os
 import re
 import threading
@@ -431,14 +431,51 @@ class App(tk.Tk):
         super().__init__()
         self.title("Конвертер чисел <-> MP3 + Табло 0..255 + EGF (audio+video)")
         self.geometry("1280x800")
+        
+        # Создаем Notebook для вкладок
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Создаем первую вкладку (основной функционал)
+        self.tab1 = tk.Frame(self.notebook)
+        self.notebook.add(self.tab1, text="EVP рендерер")
+        
+        # Создаем вторую вкладку (пустая или для нового функционала)
+        self.tab2 = tk.Frame(self.notebook)
+        self.notebook.add(self.tab2, text="Вторая вкладка")
+        
+        # Перенесите весь текущий код инициализации в отдельный метод
+        self._init_tab1()
+        
+        # Инициализируйте вторую вкладку (если нужно)
+        self._init_tab2()
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # --- file / sound helpers ---
+    def load_file_to_input(self):
+        fp = filedialog.askopenfilename(title="Выберите текстовый файл с числами",
+                                        filetypes=[("Text files", ".txt .csv .log .dat"), ("All files", "*")])
+        if not fp:
+            return
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                data = f.read()
+            self.text_input.delete('1.0', tk.END)
+            self.text_input.insert('1.0', data)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+
+    def _init_tab1(self):
         info = ("Здесь можно: загрузить файл с байтами (0..255), запустить бесконечный поток случайных фрагментов из файла (audio),\n"
-                "запустить EGF трансляцию аудио и/или видео — теперь видео также может брать байты из поля (mode=bytes)\n"
-                "и будет генерироваться непрерывный поток кадров по той же логике сборки буфера, что и аудио.")
+            "запустить EGF трансляцию аудио и/или видео — теперь видео также может брать байты из поля (mode=bytes)\n"
+            "и будет генерироваться непрерывный поток кадров по той же логике сборки буфера, что и аудио.")
 
-        tk.Label(self, text=info, justify=tk.LEFT).pack(pady=8)
+        # ИСПРАВЛЕНО: self -> self.tab1
+        tk.Label(self.tab1, text=info, justify=tk.LEFT).pack(pady=8)
 
-        top_frame = tk.Frame(self)
+        # ИСПРАВЛЕНО: self -> self.tab1
+        top_frame = tk.Frame(self.tab1)
         top_frame.pack(fill=tk.X, padx=10)
 
         self.text_input = tk.Text(top_frame, height=6, width=120)
@@ -449,15 +486,15 @@ class App(tk.Tk):
         btns_frame.pack(side=tk.LEFT, fill=tk.Y)
 
         self.random_file_btn = tk.Button(btns_frame, text="Случайный звук из файла (Старт)",
-                                         command=self.on_random_sound_from_file_toggle, width=30)
+                                     command=self.on_random_sound_from_file_toggle, width=30)
         self.random_file_btn.pack(pady=4)
 
         self.load_file_btn = tk.Button(btns_frame, text="Загрузить файл в поле ввода...",
-                                       command=self.load_file_to_input, width=30)
+                                   command=self.load_file_to_input, width=30)
         self.load_file_btn.pack(pady=4)
 
         self.create_mp3_btn = tk.Button(btns_frame, text="Экспортировать из поля в MP3",
-                                        command=self.on_create_from_text, width=30)
+                                    command=self.on_create_from_text, width=30)
         self.create_mp3_btn.pack(pady=4)
 
         self.egf_audio_btn = tk.Button(btns_frame, text="EGF аудио (Старт)", command=self.on_egf_audio_toggle, width=30)
@@ -466,10 +503,12 @@ class App(tk.Tk):
         self.egf_video_btn = tk.Button(btns_frame, text="EGF видео (Старт)", command=self.on_egf_video_toggle, width=30)
         self.egf_video_btn.pack(pady=4)
 
-        sep = tk.Frame(self, height=2, bd=1, relief=tk.SUNKEN)
+        # ИСПРАВЛЕНО: self -> self.tab1
+        sep = tk.Frame(self.tab1, height=2, bd=1, relief=tk.SUNKEN)
         sep.pack(fill=tk.X, padx=5, pady=8)
 
-        board_frame = tk.Frame(self)
+        # ИСПРАВЛЕНО: self -> self.tab1
+        board_frame = tk.Frame(self.tab1)
         board_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
 
         controls_frame = tk.Frame(board_frame)
@@ -549,21 +588,10 @@ class App(tk.Tk):
         self._init_board()
         self._render_board()
 
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # --- file / sound helpers ---
-    def load_file_to_input(self):
-        fp = filedialog.askopenfilename(title="Выберите текстовый файл с числами",
-                                        filetypes=[("Text files", ".txt .csv .log .dat"), ("All files", "*")])
-        if not fp:
-            return
-        try:
-            with open(fp, 'r', encoding='utf-8') as f:
-                data = f.read()
-            self.text_input.delete('1.0', tk.END)
-            self.text_input.insert('1.0', data)
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+    def _init_tab2(self):
+        label = tk.Label(self.tab2, text="Эта вкладка пока пуста", font=("Arial", 12), pady=20)
+        label.pack()
 
     def on_create_from_text(self):
         raw_text = self.text_input.get("1.0", tk.END).strip()
